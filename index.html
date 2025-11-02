@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>FAA NAS Status + Restrictions + Ops Plan Checker</title>
+<style>
+  body { font-family: Arial, sans-serif; margin: 40px; }
+  label { font-weight: 600; }
+  input, button { margin: 6px 4px; padding: 8px 10px; }
+  button { cursor: pointer; }
+
+  #resultPrimary { font-size: 2rem; margin-top: 18px; font-weight: 700; text-align: center; }
+  #resultPrimary a, #restrictionsStatus a, #opsPlanStatus a { text-decoration: none; }
+
+  .found { color: #c51616; }     /* red */
+  .not-found { color: #148414; } /* green */
+  .checking { color: #666; font-style: italic; }
+
+  .sections {
+    margin-top: 24px; display: block; text-align: center; color: #444; font-weight: 600; font-size: 1rem;
+  }
+  .sections ul {
+    list-style-position: inside; display: inline-block; text-align: left; margin: 8px 0 0 0; padding: 0;
+  }
+  .sections .advisories { margin-top: 10px; font-weight: 600; font-size: 0.95rem; color: #333; }
+  .sections .advisories ul { list-style-position: inside; margin: 6px 0 0 0; padding: 0; }
+
+  .subresults { margin-top: 26px; text-align: center; }
+  .subline { font-size: 1.25rem; font-weight: 700; margin: 10px 0 0; }
+
+  #timestamp { margin-top: 22px; font-size: 0.9rem; color: #777; text-align: center; }
+
+  details.debug { margin-top: 24px; }
+  details.debug summary { cursor: pointer; font-weight: 700; }
+  pre.debugbox { background: #f6f6f6; padding: 12px; overflow: auto; max-height: 280px; border: 1px solid #ddd; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+  <h2>FAA NAS Status + Restrictions + Ops Plan Checker</h2>
+
+  <p><strong>Sources:</strong>
+    <br><a href="https://nasstatus.faa.gov/" target="_blank" rel="noopener">NAS Status</a>
+    <br><a href="https://www.fly.faa.gov/restrictions/restrictions?reqFac=ALL&provFac=ALL" target="_blank" rel="noopener">Restrictions</a>
+    <br><a href="https://www.fly.faa.gov/adv/adv_spt" target="_blank" rel="noopener">Full Operations Plan</a>
+  </p>
+
+  <label for="airport">Arrival Airport:</label>
+  <input type="text" id="airport" placeholder="e.g. LGA, BOS, ATL" maxlength="4">
+  <button id="checkButton">Check</button>
+
+  <div id="resultPrimary"></div>
+  <div id="sectionsContainer" class="sections" style="display:none;"></div>
+
+  <div class="subresults">
+    <div id="restrictionsStatus" class="subline"></div>
+    <div id="opsPlanStatus" class="subline"></div>
+  </div>
+
+  <div id="timestamp"></div>
+
+  <details class="debug">
+    <summary>Debug (NAS API XML & /list card slice)</summary>
+    <div style="margin:10px 0 6px 0;"><em>First ~1200 chars of NAS XML:</em></div>
+    <pre id="nasXmlPreview" class="debugbox">(run a check to populate)</pre>
+    <div style="margin:12px 0 6px 0;"><em>NAS /list card slice (if found):</em></div>
+    <pre id="nasSlicePreview" class="debugbox">(run a check to populate)</pre>
+  </details>
+
+<script>
+/* --------- URLs --------- */
+const NAS_API_URL = "https://nasstatus.faa.gov/api/airport-status-information"; // XML
+const NAS_LIST_URL = "https://nasstatus.faa.gov/list"; // for advisory link scraping
+const NAS_URL = "https://nasstatus.faa.gov/"; // click-through
+const RESTRICTIONS_URL = "https://www.fly.faa.gov/restrictions/restrictions?reqFac=ALL&provFac=ALL";
+const OPSPLAN_URL = "https://www.fly.faa.gov/adv/adv_spt";
+
+/* --------- Fetch helpers --------- */
+async function fetchAllOrigins(url, signal) {
+  const r = await fetch(`https://api.allorigins.win/get?url=${encodeURIComponent(url)}`, { signal });
+  if (!r.ok) throw new Error(`AllOrigins status ${r.status}`);
+  const j = await r.json();
+  if (!j || typeof j.contents !== "string") throw new Error("AllOrigins malformed");
+  return j.contents;
+}
+async function fetchJina(url, signal) {
+  const jurl = "https://r.jina.ai/http://" + url.replace(/^https?:\/\//, "");
+  const r = await fetch(jurl, { signal });
+  if (!r.ok) throw new Error(`Jina status ${r.status}`);
+  return await r.text();
+}
+async function fetchTextWithFallback(url, signal) {
+  try { return await fetchAllOrigins(url, signal); }
+  catch { return await fetchJina(url, signal); }
+}
+// For NAS XML we prefer AllOrigins first (faster), then Jina
+async function fetchNasXML(signal) {
+  try { return await fetchAllOrigins(NAS_API_URL, signal); }
+  catch { return await fetchJina(NAS_API_URL, signal); }
+}
+// For /list HTML we prefer Jina first (SPA), then AllOrigins
+async function fetchNasListHTML(signal) {
+  try { return await fetchJina(NAS_LIST_URL, signal); }
+  catch { return await fetchAllOrigins(NAS_LIST_URL, signal); }
+}
+
+/* --------- Utils --------- */
+function toNormalizedText(htmlOrText) {
+  let text = htmlOrText;
+  try {
+    const doc = new DOMParser().parseFromString(htmlOrText, "text/html");
+    text = (doc.body && (doc.body.innerText || doc.body.textContent)) || htmlOrText;
+  } catch {}
+  const clean = text
+    .replace(/\u00A0/g, " ")
+    .replace(/\r\n|\r/g, "\n")
+    .replace(/[ \t\f\v]+/g, " ")
+    .replace(/[ \t]*\n[ \t]*/g, "\n");
+  return { raw: clean, norm: clean.toUpperCase() };
+}
+function esc(s) { return (s || "").replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function updateTimestamp() {
+  const now = new Date();
+  document.getElementById('timestamp').textContent =
+    `Last checked: ${now.toLocaleString('en-US', {hour:'numeric', minute:'2-digit', second:'2-digit', timeZoneName:'short'})}`;
+}
+
+/* --------- Parse NAS XML to find sections for an airport code --------- */
+function sectionsFromNasXML(xmlString, code) {
+  const CODE = code.toUpperCase();
+  let sections = new Set();
+
+  const xml = new DOMParser().parseFromString(xmlString, "text/xml");
+  // Defensive: if parsing failed, return none
+  if (!xml || xml.getElementsByTagName("parsererror").length) return [];
+
+  // The XML is grouped under many <Delay_type> elements with <Name> and list contents.
+  const types = Array.from(xml.getElementsByTagName("Delay_type"));
+  for (const t of types) {
+    const name = (t.getElementsByTagName("Name")[0]?.textContent || "").toLowerCase();
+
+    // Find all <ARPT> descendants in this delay type
+    const arpts = Array.from(t.getElementsByTagName("ARPT")).map(n => (n.textContent || "").toUpperCase());
+    const hasCode = arpts.includes(CODE);
+
+    if (hasCode) {
+      if (name.includes("ground stop")) sections.add("Ground Stop Programs");
+      else if (name.includes("ground delay")) sections.add("Ground Delay Programs");
+      else sections.add("General Arrival/Departure Delays");
+    }
+  }
+
+  // If nothing matched explicitly, the airport might still be listed under general delays elsewhere.
+  // Some feeds don’t repeat ARPT tags for general categories—so we’re conservative here.
+  return Array.from(sections);
+}
+
+/* --------- Try to extract advisory links from /list airport card --------- */
+function advisoryLinksFromNasListHTML(rawHTML, code) {
+  const CODE = code.toUpperCase();
+  const out = { links: [], slice: "" };
+
+  // Locate the airport card by data-testid="card-CODE"
+  const cardRe = new RegExp(`data-testid=["']card-${CODE}["']`, 'i');
+  const m = cardRe.exec(rawHTML);
+  if (!m) return out;
+
+  // Extract a slice around the card
+  const start = Math.max(0, m.index - 2000);
+  const slice = rawHTML.slice(start, start + 22000);
+  out.slice = slice.slice(0, 1400); // for debug preview
+
+  // Find advisory links
+  const advHrefRe = /<a[^>]*class=["'][^"']*card-external-link[^"']*["'][^>]*href=["']([^"']+)["'][^>]*>/gi;
+  const links = new Set();
+  let lm;
+  while ((lm = advHrefRe.exec(slice)) !== null) {
+    let url = lm[1].replace(/&amp;/g, '&');
+    links.add(url);
+  }
+  out.links = Array.from(links);
+  return out;
+}
+
+/* --------- Main checker --------- */
+async function checkAll() {
+  const code = document.getElementById('airport').value.trim().toUpperCase();
+  const resultPrimary = document.getElementById('resultPrimary');
+  const sectionsEl = document.getElementById('sectionsContainer');
+  const restrictionsStatus = document.getElementById('restrictionsStatus');
+  const opsPlanStatus = document.getElementById('opsPlanStatus');
+  const nasXmlPreview = document.getElementById('nasXmlPreview');
+  const nasSlicePreview = document.getElementById('nasSlicePreview');
+
+  document.getElementById('timestamp').textContent = "";
+  sectionsEl.style.display = "none";
+  sectionsEl.innerHTML = "";
+  restrictionsStatus.innerHTML = "";
+  opsPlanStatus.innerHTML = "";
+  nasXmlPreview.textContent = "(run a check to populate)";
+  nasSlicePreview.textContent = "(run a check to populate)";
+
+  if (!code || code.length < 3) {
+    resultPrimary.textContent = 'Please enter a valid 3-letter airport code.';
+    resultPrimary.className = '';
+    return;
+  }
+
+  // Progress text
+  resultPrimary.textContent = 'Checking NAS Status...';
+  resultPrimary.className = 'checking';
+  restrictionsStatus.textContent = 'Checking Restrictions...';
+  restrictionsStatus.className = 'checking';
+  opsPlanStatus.textContent = 'Checking Ops Plan...';
+  opsPlanStatus.className = 'checking';
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 30000);
+
+  try {
+    /* ---------- NAS Status via official XML API ---------- */
+    const nasXML = await fetchNasXML(controller.signal);
+    nasXmlPreview.textContent = esc(nasXML.slice(0, 1200)); // debug preview of XML
+
+    const sections = sectionsFromNasXML(nasXML, code);
+
+    if (sections.length === 0) {
+      resultPrimary.className = 'not-found';
+      resultPrimary.innerHTML = `<a href="${NAS_URL}" target="_blank" class="not-found">&#9989; NAS Status Mention Not Found</a>`;
+    } else {
+      resultPrimary.className = 'found';
+      resultPrimary.innerHTML = `<a href="${NAS_URL}" target="_blank" class="found">&#10060; NAS Status Mention Found</a>`;
+      const items = sections.map(s => `<li>${s}</li>`).join('');
+      sectionsEl.style.display = "block";
+      sectionsEl.innerHTML = `<ul>${items}</ul>`;
+    }
+
+    /* ---------- Optional: advisory links from /list (best-effort) ---------- */
+    try {
+      const listHTML = await fetchNasListHTML(controller.signal);
+      const { links, slice } = advisoryLinksFromNasListHTML(listHTML, code);
+      if (slice) nasSlicePreview.textContent = esc(slice);
+      if (links && links.length) {
+        const existing = sectionsEl.innerHTML || "";
+        const advList = links.map(u => `<li><a href="${u}" target="_blank" rel="noopener">${u}</a></li>`).join('');
+        sectionsEl.style.display = "block";
+        sectionsEl.innerHTML = existing + `<div class="advisories">Advisory link(s):<ul>${advList}</ul></div>`;
+      }
+    } catch { /* ignore: advisory links are optional */ }
+
+    /* ---------- Restrictions ---------- */
+    const restrRaw = await fetchTextWithFallback(RESTRICTIONS_URL, controller.signal);
+    const { norm: restrNorm } = toNormalizedText(restrRaw);
+    const restrFound = new RegExp(`(^|[^A-Z0-9])\\(?${code}\\)?(?=[^A-Z0-9]|$)`, 'i').test(restrNorm);
+
+    if (restrFound) {
+      restrictionsStatus.className = 'subline found';
+      restrictionsStatus.innerHTML = `<a href="${RESTRICTIONS_URL}" target="_blank" class="found">&#10060; Restriction Found</a>`;
+    } else {
+      restrictionsStatus.className = 'subline not-found';
+      restrictionsStatus.innerHTML = `<a href="${RESTRICTIONS_URL}" target="_blank" class="not-found">&#9989; No Restriction Found</a>`;
+    }
+
+    /* ---------- Ops Plan ---------- */
+    const opsRaw = await fetchTextWithFallback(OPSPLAN_URL, controller.signal);
+    const { norm: opsNorm } = toNormalizedText(opsRaw);
+    const opsFound = new RegExp(`(^|[^A-Z0-9])\\(?${code}\\)?(?=[^A-Z0-9]|$)`, 'i').test(opsNorm);
+
+    if (opsFound) {
+      opsPlanStatus.className = 'subline found';
+      opsPlanStatus.innerHTML = `<a href="${OPSPLAN_URL}" target="_blank" class="found">&#10060; Ops Plan Mention Found</a>`;
+    } else {
+      opsPlanStatus.className = 'subline not-found';
+      opsPlanStatus.innerHTML = `<a href="${OPSPLAN_URL}" target="_blank" class="not-found">&#9989; Ops Plan Mention Not Found</a>`;
+    }
+
+    updateTimestamp();
+  } catch (e) {
+    console.error(e);
+    resultPrimary.className = '';
+    resultPrimary.textContent = 'Error fetching pages.';
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/* UI */
+document.getElementById('checkButton').addEventListener('click', checkAll);
+document.getElementById('airport').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); checkAll(); }
+});
+</script>
+</body>
+</html>
